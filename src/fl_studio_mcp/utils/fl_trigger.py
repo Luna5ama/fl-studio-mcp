@@ -11,6 +11,8 @@ import subprocess
 import time
 from typing import Callable
 
+from fl_studio_mcp.utils.midi_connection import _mailbox_lock
+
 # Delay after triggering to allow FL Studio to process
 TRIGGER_DELAY = 2.0
 
@@ -40,7 +42,7 @@ class FLStudioTrigger:
         """Trigger FL Studio on macOS using osascript."""
         try:
             # Use osascript to send keystroke to FL Studio
-            script = '''
+            script = """
             tell application "FL Studio"
                 activate
             end tell
@@ -48,7 +50,7 @@ class FLStudioTrigger:
             tell application "System Events"
                 keystroke "y" using {command down, option down}
             end tell
-            '''
+            """
             subprocess.run(
                 ["osascript", "-e", script],
                 capture_output=True,
@@ -89,90 +91,22 @@ class FLStudioTrigger:
             return False
 
     def _focus_fl_studio_windows(self) -> bool:
-        """Bring the FL Studio window to the foreground on Windows.
+        """Activate the unique FL main window through the shared ownership guard."""
+        from fl_studio_mcp.utils.windows_ui import FLWindows
 
-        The keystroke that triggers the ComposeWithLLM script is delivered to
-        whichever window has focus, so FL Studio must be foregrounded first
-        (mirroring the ``activate`` step used on macOS). Uses only ctypes/user32
-        so no extra dependency is required.
-
-        Returns:
-            True if an FL Studio window was found and foregrounded, else False.
-        """
         try:
-            import ctypes
-            from ctypes import wintypes
-
-            user32 = ctypes.windll.user32
-
-            found = {"hwnd": None}
-
-            EnumWindowsProc = ctypes.WINFUNCTYPE(
-                ctypes.c_bool, wintypes.HWND, wintypes.LPARAM
-            )
-
-            def _enum(hwnd, _lparam):
-                if not user32.IsWindowVisible(hwnd):
-                    return True
-                length = user32.GetWindowTextLengthW(hwnd)
-                if length == 0:
-                    return True
-                buffer = ctypes.create_unicode_buffer(length + 1)
-                user32.GetWindowTextW(hwnd, buffer, length + 1)
-                # FL Studio's main window title contains "FL Studio"
-                if "FL Studio" in buffer.value:
-                    found["hwnd"] = hwnd
-                    return False  # stop enumerating
+            with FLWindows():
                 return True
-
-            user32.EnumWindows(EnumWindowsProc(_enum), 0)
-
-            hwnd = found["hwnd"]
-            if not hwnd:
-                return False
-
-            # Restore if minimized, then foreground it.
-            SW_RESTORE = 9
-            user32.ShowWindow(hwnd, SW_RESTORE)
-
-            # Windows normally forbids a background process from stealing focus.
-            # Tapping ALT unlocks SetForegroundWindow for this call.
-            VK_MENU = 0x12
-            KEYEVENTF_KEYUP = 0x0002
-            user32.keybd_event(VK_MENU, 0, 0, 0)
-            user32.SetForegroundWindow(hwnd)
-            user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
-
-            return True
         except Exception:
             return False
 
     def _trigger_windows(self) -> bool:
-        """Trigger FL Studio on Windows using pynput.
+        """Send the Piano Roll shortcut only while the FL process owns focus."""
+        from fl_studio_mcp.utils.windows_ui import FLWindows
 
-        Foregrounds FL Studio first so the Ctrl+Alt+Y hotkey actually reaches
-        it; returns False (so the caller reports a manual-trigger warning) if the
-        FL Studio window can't be found.
-        """
         try:
-            from pynput.keyboard import Controller, Key
-
-            if not self._focus_fl_studio_windows():
-                return False
-
-            # Give FL Studio a moment to accept focus before the keystroke.
-            time.sleep(0.3)
-
-            keyboard = Controller()
-
-            # Send Ctrl+Alt+Y
-            keyboard.press(Key.ctrl)
-            keyboard.press(Key.alt)
-            keyboard.press("y")
-            keyboard.release("y")
-            keyboard.release(Key.alt)
-            keyboard.release(Key.ctrl)
-
+            with FLWindows() as windows:
+                windows.press("ctrl+alt+y")
             return True
         except Exception:
             return False
@@ -186,14 +120,15 @@ class FLStudioTrigger:
         Returns:
             True if the trigger was sent successfully, False otherwise.
         """
-        if self._trigger_func is None:
-            return False
+        with _mailbox_lock:
+            if self._trigger_func is None:
+                return False
 
-        success = self._trigger_func()
-        if success and delay > 0:
-            time.sleep(delay)
+            success = self._trigger_func()
+            if success and delay > 0:
+                time.sleep(delay)
 
-        return success
+            return success
 
     @property
     def is_supported(self) -> bool:

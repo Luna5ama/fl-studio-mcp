@@ -14,10 +14,16 @@ instead of keystrokes.
 from __future__ import annotations
 
 import json
+import os
 import platform
+import threading
 import time
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+from fl_studio_mcp.utils.fl_paths import get_user_data_dir
 
 
 def _get_fl_hardware_dir() -> Path:
@@ -25,7 +31,7 @@ def _get_fl_hardware_dir() -> Path:
     system = platform.system()
 
     if system in ("Darwin", "Windows"):
-        base = Path.home() / "Documents" / "Image-Line" / "FL Studio" / "Settings"
+        base = get_user_data_dir() / "Settings"
     else:
         # Linux fallback
         base = Path.home() / ".fl-studio" / "Settings"
@@ -33,6 +39,9 @@ def _get_fl_hardware_dir() -> Path:
     hardware_dir = base / "Hardware" / "FLStudioMCP"
     hardware_dir.mkdir(parents=True, exist_ok=True)
     return hardware_dir
+
+
+_mailbox_lock = threading.RLock()
 
 
 class MIDIConnection:
@@ -51,6 +60,7 @@ class MIDIConnection:
         self._port_name: str | None = None
         self._connected = False
         self._error: str | None = None
+        self._command_lock = _mailbox_lock
 
         # File paths for JSON communication
         self._hardware_dir = _get_fl_hardware_dir()
@@ -72,74 +82,82 @@ class MIDIConnection:
 
         Returns True if connection successful, False otherwise.
         """
-        if self._connected and self._port is not None:
-            return True
+        with self._command_lock:
+            if self._connected and self._port is not None:
+                return True
 
-        try:
-            import mido
-        except ImportError:
-            self._error = (
-                "mido library not installed. Install with: pip install mido python-rtmidi"
-            )
-            return False
+            try:
+                import mido
+            except ImportError:
+                self._error = (
+                    "mido library not installed. Install with: pip install mido python-rtmidi"
+                )
+                return False
 
-        # Find available MIDI output ports
-        try:
-            output_ports = mido.get_output_names()
-        except Exception as e:
-            self._error = f"Failed to get MIDI ports: {e}"
-            return False
+            # Find available MIDI output ports
+            try:
+                output_ports = mido.get_output_names()
+            except Exception as e:
+                self._error = f"Failed to get MIDI ports: {e}"
+                return False
 
-        if not output_ports:
-            self._error = (
-                "No MIDI output ports found. On Mac, enable IAC Driver in Audio MIDI Setup."
-            )
-            return False
+            if not output_ports:
+                self._error = (
+                    "No MIDI output ports found. On Mac, enable IAC Driver in Audio MIDI Setup."
+                )
+                return False
 
-        # Look for IAC Driver (Mac) or other virtual MIDI ports
-        target_port = None
-        for port_name in output_ports:
-            # Prefer IAC Driver on Mac
-            if "IAC" in port_name:
-                target_port = port_name
-                break
-            # Also accept loopMIDI on Windows or any port with "FL" in name
-            if "loopMIDI" in port_name or "FL" in port_name.upper():
-                target_port = port_name
-                break
+            configured = os.environ.get("FL_STUDIO_MIDI_PORT")
+            if configured:
+                target_port = configured if configured in output_ports else None
+            else:
+                candidates = [
+                    name
+                    for name in output_ports
+                    if any(token in name.upper() for token in ("IAC", "LOOPMIDI", "FL"))
+                ]
+                target_port = candidates[0] if len(candidates) == 1 else None
+            if target_port is None:
+                self._error = (
+                    "No unambiguous FL virtual MIDI output. Start loopMIDI and enable its input "
+                    "in FL, or set FL_STUDIO_MIDI_PORT to the exact output port name. "
+                    f"Available ports: {output_ports}"
+                )
+                return False
 
-        # If no specific port found, use the first available
-        if target_port is None:
-            target_port = output_ports[0]
-
-        try:
-            self._port = mido.open_output(target_port)
-            self._port_name = target_port
-            self._connected = True
-            self._error = None
-            return True
-        except Exception as e:
-            self._error = f"Failed to open MIDI port '{target_port}': {e}"
-            return False
+            try:
+                self._port = mido.open_output(target_port)
+                self._port_name = target_port
+                self._connected = True
+                self._error = None
+                return True
+            except Exception as e:
+                self._error = f"Failed to open MIDI port '{target_port}': {e}"
+                return False
 
     def disconnect(self) -> None:
         """Close the MIDI connection."""
-        if self._port is not None:
-            try:
-                self._port.close()
-            except Exception:
-                pass
-            self._port = None
-        self._connected = False
-        self._port_name = None
+        with self._command_lock:
+            if self._port is not None:
+                try:
+                    self._port.close()
+                except Exception:
+                    pass
+                self._port = None
+            self._connected = False
+            self._port_name = None
 
     def ensure_connected(self) -> None:
         """Ensure connection to FL Studio is active. Raises RuntimeError if not."""
         if not self.is_connected:
             if not self.connect():
-                raise RuntimeError(
-                    self._error or "Failed to connect to FL Studio via MIDI"
-                )
+                raise RuntimeError(self._error or "Failed to connect to FL Studio via MIDI")
+
+    @contextmanager
+    def transaction(self):
+        """Serialize a complete multi-command/UI operation within this server."""
+        with self._command_lock:
+            yield self
 
     def send_command(
         self,
@@ -160,17 +178,27 @@ class MIDIConnection:
         Raises:
             RuntimeError: If not connected or command fails
         """
+        # The controller has one command/response mailbox, shared by all MCP tools.
+        with self._command_lock:
+            return self._send_command(action, params, timeout)
+
+    def _send_command(
+        self, action: str, params: dict[str, Any] | None, timeout: float
+    ) -> dict[str, Any]:
         self.ensure_connected()
 
         # Prepare command
         command = {
             "action": action,
             "params": params or {},
+            "request_id": uuid.uuid4().hex,
         }
 
         # Write command to file
         try:
-            self._command_file.write_text(json.dumps(command, indent=2))
+            temporary = self._command_file.with_suffix(".tmp")
+            temporary.write_text(json.dumps(command, indent=2), encoding="utf-8")
+            temporary.replace(self._command_file)
         except Exception as e:
             return {"success": False, "error": f"Failed to write command file: {e}"}
 
@@ -184,15 +212,16 @@ class MIDIConnection:
         # Send MIDI trigger
         try:
             import mido
+
             trigger_msg = mido.Message("note_on", note=self.TRIGGER_NOTE, velocity=127)
             self._port.send(trigger_msg)
         except Exception as e:
             return {"success": False, "error": f"Failed to send MIDI trigger: {e}"}
 
         # Wait for response
-        return self._wait_for_response(timeout)
+        return self._wait_for_response(timeout, command["request_id"])
 
-    def _wait_for_response(self, timeout: float) -> dict[str, Any]:
+    def _wait_for_response(self, timeout: float, request_id: str | None = None) -> dict[str, Any]:
         """Wait for response file to appear and read it.
 
         Args:
@@ -201,14 +230,23 @@ class MIDIConnection:
         Returns:
             Response dictionary or error dict if timeout
         """
-        start_time = time.time()
+        start_time = time.monotonic()
         poll_interval = 0.02  # 20ms between checks
 
-        while time.time() - start_time < timeout:
+        while time.monotonic() - start_time < timeout:
             if self._response_file.exists():
                 try:
-                    response_text = self._response_file.read_text()
+                    response_text = self._response_file.read_text(encoding="utf-8")
                     response = json.loads(response_text)
+
+                    # Missing ids remain compatible with older controller versions.
+                    if (
+                        request_id is not None
+                        and response.get("request_id") is not None
+                        and response["request_id"] != request_id
+                    ):
+                        self._response_file.unlink(missing_ok=True)
+                        continue
 
                     # Clean up response file
                     try:
@@ -217,8 +255,9 @@ class MIDIConnection:
                         pass
 
                     return response
-                except json.JSONDecodeError as e:
-                    return {"success": False, "error": f"Invalid JSON in response: {e}"}
+                except json.JSONDecodeError:
+                    # FL's sandbox requires in-place writes; wait out partial JSON.
+                    pass
                 except Exception as e:
                     return {"success": False, "error": f"Failed to read response: {e}"}
 
@@ -237,6 +276,7 @@ class MIDIConnection:
         """Get connection status information."""
         try:
             import mido
+
             output_ports = mido.get_output_names()
         except Exception:
             output_ports = []
@@ -266,6 +306,7 @@ def get_connection() -> MIDIConnection:
 def reset_connection() -> None:
     """Reset the connection state to allow reconnection attempts."""
     global _connection
-    if _connection is not None:
-        _connection.disconnect()
-        _connection = None
+    with _mailbox_lock:
+        if _connection is not None:
+            _connection.disconnect()
+            _connection = None

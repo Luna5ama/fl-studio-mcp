@@ -63,7 +63,16 @@ Write-Host ""
 Write-Host "Copying controller and Piano Roll scripts into FL Studio Settings..."
 Write-Host ""
 
-$FlSettings = Join-Path $env:USERPROFILE "Documents\Image-Line\FL Studio\Settings"
+$FlUserData = $env:FL_STUDIO_USER_DATA_DIR
+if (-not $FlUserData) {
+    $SharedPaths = Get-ItemProperty -LiteralPath 'HKCU:\Software\Image-Line\Shared\Paths' -ErrorAction SilentlyContinue
+    if ($SharedPaths -and $SharedPaths.'Shared data') {
+        $FlUserData = Join-Path $SharedPaths.'Shared data' 'FL Studio'
+    } else {
+        $FlUserData = Join-Path $env:USERPROFILE 'Documents\Image-Line\FL Studio'
+    }
+}
+$FlSettings = Join-Path $FlUserData 'Settings'
 $HardwareDir = Join-Path $FlSettings "Hardware\FLStudioMCP"
 $PianoScriptsDir = Join-Path $FlSettings "Piano roll scripts"
 
@@ -74,20 +83,19 @@ if (Test-Path -LiteralPath $ControllerSrc) {
     if (-not (Test-Path -LiteralPath $HardwareDir)) {
         New-Item -ItemType Directory -Path $HardwareDir -Force | Out-Null
     }
-    Copy-Item -LiteralPath $ControllerSrc -Destination (Join-Path $HardwareDir "device_FLStudioMCP.py") -Force
+    & uv run --directory $ScriptDir python (Join-Path $ScriptDir 'scripts\install_controller.py') --user-data-dir $FlUserData
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     Write-Color "[OK] MIDI controller copied to FL Studio Hardware\FLStudioMCP" "Green"
 } else {
     Write-Color "! device_FLStudioMCP.py not found - copy fl_controller\device_FLStudioMCP.py manually" "Yellow"
 }
 
-if (Test-Path -LiteralPath $PianoSrc) {
-    if (-not (Test-Path -LiteralPath $PianoScriptsDir)) {
-        New-Item -ItemType Directory -Path $PianoScriptsDir -Force | Out-Null
-    }
-    Copy-Item -LiteralPath $PianoSrc -Destination (Join-Path $PianoScriptsDir "ComposeWithLLM.pyscript") -Force
-    Write-Color "[OK] Piano Roll script copied" "Green"
+# install_controller.py installs and bakes the Piano Roll data path as well.
+$PianoDest = Join-Path $PianoScriptsDir "ComposeWithLLM.pyscript"
+if (Test-Path -LiteralPath $PianoDest) {
+    Write-Color "[OK] Piano Roll script installed with the resolved user-data path" "Green"
 } else {
-    Write-Color "! ComposeWithLLM.pyscript not found - some features may be limited" "Yellow"
+    Write-Color "! Piano Roll script missing; rerun scripts\install_controller.py" "Yellow"
 }
 
 # Step 4: Verify Piano Roll script (same check as install.sh)

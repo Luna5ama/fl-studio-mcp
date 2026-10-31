@@ -1,7 +1,7 @@
 """Plugin control tools for FL Studio.
 
-NOTE: These tools can only control EXISTING plugins. FL Studio's scripting API
-does not support loading new plugins programmatically.
+These tools control loaded plugins. Discovery and Browser-based loading are
+registered separately in plugin_loading.py.
 """
 
 from __future__ import annotations

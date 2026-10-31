@@ -18,9 +18,11 @@ Communication flow:
 6. MCP server reads response
 """
 
+import importlib
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 # FL Studio API modules (available when running inside FL Studio)
@@ -29,6 +31,10 @@ import midi
 import mixer
 import plugins
 import transport
+import ui
+
+# Filled in by scripts/install_controller.py for relocated FL Studio user data.
+USER_DATA_DIR = None
 
 
 def _get_script_dir() -> Path:
@@ -37,6 +43,9 @@ def _get_script_dir() -> Path:
     FL Studio's Python environment doesn't support __file__, so we construct
     the path based on the platform's standard FL Studio settings location.
     """
+    override = USER_DATA_DIR or os.environ.get("FL_STUDIO_USER_DATA_DIR")
+    if override:
+        return Path(override).expanduser() / "Settings" / "Hardware" / "FLStudioMCP"
     if sys.platform == "darwin":
         # macOS
         base = Path.home() / "Documents" / "Image-Line" / "FL Studio" / "Settings"
@@ -56,8 +65,41 @@ SCRIPT_DIR = _get_script_dir()
 COMMAND_FILE = SCRIPT_DIR / "mcp_command.json"
 RESPONSE_FILE = SCRIPT_DIR / "mcp_response.json"
 
+# Add-ons are installed alongside this script, never imported from user input.
+# FL keeps helper modules cached when refreshing the controller device.
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+_addons = {}
+_addon_errors = {}
+for _module_name in (
+    "mcp_system",
+    "mcp_plugin_management",
+    "mcp_arrangement",
+    "mcp_routing",
+    "mcp_project_files",
+):
+    try:
+        if _module_name in sys.modules:
+            _module = importlib.reload(sys.modules[_module_name])
+        else:
+            _module = importlib.import_module(_module_name)
+        if hasattr(_module, "configure"):
+            _module.configure(SCRIPT_DIR)
+        _addons[_module_name] = _module
+    except Exception as _module_error:
+        _addon_errors[_module_name] = str(_module_error)
+
+
 # MIDI trigger note
 TRIGGER_NOTE = 127
+
+# Loading must yield to FL's UI loop; never sleep or load plugins on a worker thread.
+_plugin_load = None
+_plugin_load_steps = None
+_advancing_plugin_load = False
+_last_request_id = None
+_last_response = None
+_idle_running = False
 
 
 def OnInit():
@@ -67,8 +109,31 @@ def OnInit():
     print(f"Response file: {RESPONSE_FILE}")
 
 
+def _restore_loader_browser():
+    if _plugin_load is not None and "_browser_auto_hide" in _plugin_load:
+        ui.setBrowserAutoHide(_plugin_load["_browser_auto_hide"])
+        del _plugin_load["_browser_auto_hide"]
+
+
 def OnDeInit():
     """Called when the script is unloaded."""
+    if _plugin_load is not None:
+        try:
+            _restore_loader_browser()
+            if (
+                _plugin_load.get("status") == "loading"
+                and not _plugin_load.get("_issued")
+                and _plugin_load.get("_menu_opened")
+            ):
+                ui.closeActivePopupMenu()
+        except Exception as exc:
+            print("Loader preference cleanup: " + str(exc))
+    for name, module in _addons.items():
+        if hasattr(module, "on_deinit"):
+            try:
+                module.on_deinit()
+            except Exception as exc:
+                print(name + " cleanup: " + str(exc))
     print("FL Studio MCP Controller deinitialized")
 
 
@@ -82,12 +147,27 @@ def OnMidiMsg(event):
 
 def OnIdle():
     """Called periodically when FL Studio is idle."""
-    pass  # Required FL Studio API hook; no polling needed
+    global _idle_running
+    if _idle_running:
+        return
+    _idle_running = True
+    try:
+        advance_plugin_load()
+        for name, module in _addons.items():
+            if hasattr(module, "on_idle"):
+                try:
+                    module.on_idle()
+                except Exception as exc:
+                    _addon_errors[name] = "Idle callback: " + str(exc)
+    finally:
+        _idle_running = False
 
 
 def execute_pending_command():
     """Read command from JSON file, execute it, and write response."""
+    global _last_request_id, _last_response
     response = {"success": False, "error": None}
+    request_id = None
 
     try:
         # Read command file
@@ -96,8 +176,12 @@ def execute_pending_command():
             write_response(response)
             return
 
-        command_text = COMMAND_FILE.read_text()
+        command_text = COMMAND_FILE.read_text(encoding="utf-8")
         command = json.loads(command_text)
+        request_id = command.get("request_id")
+        if request_id is not None and request_id == _last_request_id:
+            write_response(_last_response)
+            return
 
         action = command.get("action", "")
         params = command.get("params", {})
@@ -111,19 +195,92 @@ def execute_pending_command():
     except Exception as e:
         response["error"] = f"Error executing command: {e}"
 
+    if request_id is not None:
+        response["request_id"] = request_id
+        _last_request_id, _last_response = request_id, response
     write_response(response)
 
 
 def write_response(response: dict):
     """Write response to JSON file."""
     try:
-        RESPONSE_FILE.write_text(json.dumps(response, indent=2))
+        # FL's embedded Python permits writing in the controller folder but
+        # restricts rename/replace operations. The client tolerates partial JSON
+        # and correlates request ids, so publish directly as required by FL.
+        RESPONSE_FILE.write_text(json.dumps(response, indent=2), encoding="utf-8")
     except Exception as e:
         print(f"Error writing response: {e}")
 
 
 def dispatch_command(action: str, params: dict) -> dict:
     """Route command to appropriate handler and return result."""
+
+    if action.startswith("system.") and "mcp_system" in _addons:
+        result = _addons["mcp_system"].dispatch(action, params)
+        if result is not None:
+            result["addon_errors"] = dict(_addon_errors)
+            result["addons"] = list(_addons)
+            return result
+
+    if action == "plugins.getLoadStatus":
+        if _plugin_load is None or params.get("operation_id") != _plugin_load["operation_id"]:
+            raise ValueError("Unknown plugin loading operation")
+        # Some controller configurations deliver MIDI but no OnIdle callbacks.
+        # One step per status request still yields to FL's UI between messages.
+        advance_plugin_load()
+        return {key: value for key, value in _plugin_load.items() if not key.startswith("_")}
+    if action in ("plugins.confirmLoadMenu", "plugins.cancelLoad"):
+        if (
+            _plugin_load is None
+            or _plugin_load["status"] != "loading"
+            or params.get("operation_id") != _plugin_load["operation_id"]
+        ):
+            raise ValueError("Unknown active plugin loading operation")
+        if action == "plugins.cancelLoad":
+            if _plugin_load.get("_issued"):
+                _plugin_load["cancellation_requested"] = True
+                return {"status": "loading", "activation_may_have_occurred": True}
+            _plugin_load.update(
+                success=False, status="cancelled", error=params.get("error", "Cancelled")
+            )
+            if not _plugin_load.get("_issued") and _plugin_load.get("_menu_opened"):
+                ui.closeActivePopupMenu()
+            _restore_loader_browser()
+            return {"status": "cancelled"}
+        if _plugin_load.get("stage") not in ("awaiting_menu", "awaiting_drag"):
+            raise RuntimeError("Plugin destination is no longer ready")
+        if _plugin_load["kind"] == "generator" and not ui.isInPopupMenu():
+            raise RuntimeError("Plugin menu is no longer ready")
+        if _plugin_load["kind"] == "effect" and mixer.trackNumber() != _plugin_load["_track"]:
+            raise RuntimeError("Mixer target changed before plugin activation")
+        if _plugin_load["kind"] == "effect":
+            slot = _plugin_load["destination_slot"]
+            if plugins.isValid(_plugin_load["_track"], slot, True):
+                raise RuntimeError("Destination effect slot is no longer empty")
+        _plugin_load["_issued"] = True
+        _plugin_load["stage"] = "verify"
+        return {"status": "ready"}
+    if _plugin_load is not None and _plugin_load["status"] == "loading":
+        raise RuntimeError(
+            "A plugin is loading; wait for plugins.getLoadStatus before other commands"
+        )
+    for name, module in _addons.items():
+        if hasattr(module, "is_busy") and module.is_busy():
+            namespace = {
+                "mcp_plugin_management": "pluginManagement.",
+                "mcp_arrangement": "arrangement.",
+                "mcp_project_files": "projectFiles.",
+                "mcp_routing": "routing.",
+            }.get(name)
+            if namespace is None or not action.startswith(namespace):
+                raise RuntimeError("A native operation is active in " + name)
+    if action == "plugins.beginLoad":
+        return begin_plugin_load(params)
+
+    for module in _addons.values():
+        result = module.dispatch(action, params)
+        if result is not None:
+            return result
 
     # Transport commands
     if action == "transport.start":
@@ -230,7 +387,7 @@ def dispatch_command(action: str, params: dict) -> dict:
         return handle_plugins_get_color(params)
 
     else:
-        return {"error": f"Unknown action: {action}"}
+        return {"success": False, "error": f"Unknown action: {action}"}
 
 
 # =============================================================================
@@ -344,14 +501,16 @@ def handle_mixer_get_all_tracks(params: dict) -> dict:
             if i != 0:  # Always include master
                 continue
 
-        tracks.append({
-            "index": i,
-            "name": name if name else ("Master" if i == 0 else f"Insert {i}"),
-            "volume": mixer.getTrackVolume(i),
-            "pan": mixer.getTrackPan(i),
-            "is_muted": mixer.isTrackMuted(i) == 1,
-            "is_solo": mixer.isTrackSolo(i) == 1,
-        })
+        tracks.append(
+            {
+                "index": i,
+                "name": name if name else ("Master" if i == 0 else f"Insert {i}"),
+                "volume": mixer.getTrackVolume(i),
+                "pan": mixer.getTrackPan(i),
+                "is_muted": mixer.isTrackMuted(i) == 1,
+                "is_solo": mixer.isTrackSolo(i) == 1,
+            }
+        )
 
     return {"tracks": tracks}
 
@@ -482,13 +641,15 @@ def handle_channels_get_all() -> dict:
     count = channels.channelCount(True)
 
     for i in range(count):
-        channels_list.append({
-            "index": i,
-            "name": channels.getChannelName(i, True),
-            "is_muted": channels.isChannelMuted(i, True) == 1,
-            "is_selected": channels.isChannelSelected(i, True) == 1,
-            "target_fx_track": channels.getTargetFxTrack(i, True),
-        })
+        channels_list.append(
+            {
+                "index": i,
+                "name": channels.getChannelName(i, True),
+                "is_muted": channels.isChannelMuted(i, True) == 1,
+                "is_selected": channels.isChannelSelected(i, True) == 1,
+                "target_fx_track": channels.getTargetFxTrack(i, True),
+            }
+        )
 
     return {"channels": channels_list}
 
@@ -748,12 +909,14 @@ def handle_plugins_get_params(params: dict) -> dict:
                 value = plugins.getParamValue(i, index, -1, use_global)
                 value_str = plugins.getParamValueString(i, index, -1, use_global)
 
-            param_list.append({
-                "index": i,
-                "name": name,
-                "value": value,
-                "value_string": value_str,
-            })
+            param_list.append(
+                {
+                    "index": i,
+                    "name": name,
+                    "value": value,
+                    "value_string": value_str,
+                }
+            )
         except Exception as e:
             print(f"Warning: could not read param {i}: {e}")
             continue
@@ -873,3 +1036,238 @@ def handle_plugins_get_color(params: dict) -> dict:
         color = plugins.getColor(index, -1, use_global)
 
     return {"color": hex(color)}
+
+
+def begin_plugin_load(params: dict) -> dict:
+    """Validate the preset and snapshot its destination before touching the Browser."""
+    global _plugin_load, _plugin_load_steps
+    kind = params.get("kind")
+    if kind not in ("generator", "effect"):
+        raise ValueError("kind must be generator or effect")
+    timeout = params.get("timeout", 60.0)
+    if not isinstance(timeout, (int, float)) or not 5 <= timeout <= 180:
+        raise ValueError("timeout must be between 5 and 180 seconds")
+    plugin_id = params.get("plugin_id", "")
+    if not isinstance(plugin_id, str) or "\\" in plugin_id:
+        raise ValueError("Use a plugin id returned by fl_list_available_plugins")
+    parts = plugin_id.split("/")
+    category = "Generators" if kind == "generator" else "Effects"
+    if (
+        len(parts) < 4
+        or parts[:2] != ["Installed", category]
+        or any(part in ("", ".", "..") or ":" in part for part in parts)
+    ):
+        raise ValueError("Invalid plugin database id or plugin kind")
+    database = SCRIPT_DIR.parents[2] / "Presets" / "Plugin database"
+    preset = database.joinpath(*parts).resolve()
+    if not preset.is_relative_to(database.resolve()) or preset.suffix.lower() != ".fst":
+        raise ValueError("Preset must be an .fst file inside the Plugin database")
+    if not preset.is_file():
+        raise ValueError("Plugin preset is missing; scan plugins in Plugin Manager first")
+    if not hasattr(ui, "toggleBrowserNode"):
+        raise RuntimeError("Plugin loading requires FL Studio MIDI scripting API 34 or later")
+    if ui.isInPopupMenu():
+        raise RuntimeError("Close the popup menu in FL Studio before loading plugins")
+    track = params.get("mixer_track")
+    if kind == "effect" and track is None:
+        raise ValueError("mixer_track is required for effects")
+    if track is not None and (type(track) is not int or not 0 <= track < mixer.trackCount() - 1):
+        raise ValueError("Invalid mixer track (the special Current track is not a destination)")
+    state = {
+        "operation_id": str(time.monotonic_ns()),
+        "status": "loading",
+        "success": True,
+        "plugin_id": plugin_id,
+        "kind": kind,
+        "_deadline": time.monotonic() + timeout,
+        "_track": track,
+        "_channels": channels.channelCount(True),
+        "_browser_auto_hide": ui.isBrowserAutoHide(),
+    }
+    if kind == "effect":
+        state["_slots"] = [plugins.isValid(track, slot, True) for slot in range(10)]
+        state["_slot_names"] = [
+            plugins.getPluginName(track, slot, 0, True) if valid else None
+            for slot, valid in enumerate(state["_slots"])
+        ]
+        if all(state["_slots"]):
+            raise ValueError("Mixer track has no empty effect slots")
+    _plugin_load = state
+    _plugin_load_steps = load_plugin_steps(parts)
+    return {"operation_id": state["operation_id"], "status": "loading"}
+
+
+def advance_plugin_load():
+    """Advance at most one UI step per idle callback, then verify asynchronously."""
+    global _plugin_load_steps, _advancing_plugin_load
+    if _advancing_plugin_load or _plugin_load is None or _plugin_load["status"] != "loading":
+        return
+    _advancing_plugin_load = True
+    try:
+        if time.monotonic() >= _plugin_load["_deadline"]:
+            raise RuntimeError("Plugin loading timed out; inspect FL Studio before retrying")
+        next(_plugin_load_steps)
+    except StopIteration:
+        _plugin_load_steps = None
+        _restore_loader_browser()
+    except Exception as exc:
+        _plugin_load.update(
+            success=False,
+            status="unknown" if _plugin_load.get("_issued") else "failed",
+            activation_may_have_occurred=bool(_plugin_load.get("_issued")),
+            error=str(exc),
+        )
+        if _plugin_load.get("_menu_opened") and not _plugin_load.get("_issued"):
+            ui.closeActivePopupMenu()
+        _plugin_load_steps = None
+        _restore_loader_browser()
+    finally:
+        _advancing_plugin_load = False
+
+
+def move_browser(direction):
+    """Let delayed plugin editor windows settle without losing Browser input."""
+    for _ in range(5):
+        ui.setFocused(midi.widBrowser)
+        yield
+        before = (ui.getFocusedNodeCaption(), ui.getFocusedNodeFileType())
+        ui.navigateBrowser(direction, 0)
+        yield
+        if before != (ui.getFocusedNodeCaption(), ui.getFocusedNodeFileType()):
+            return True
+        if ui.getFocused(midi.widBrowser):
+            return False
+    raise RuntimeError("Browser focus changed repeatedly; leave FL Studio untouched while loading")
+
+
+def load_plugin_steps(parts):
+    """Navigate collapsed Browser siblings and activate a scanned plugin entry."""
+    state = _plugin_load
+    state["stage"] = "browser"
+    ui.setBrowserAutoHide(0)
+    ui.showWindow(midi.widBrowser)
+    ui.setFocused(midi.widBrowser)
+    ui.navigateBrowserTabs(0)  # ALL tab, independent of the user's current tab.
+    yield
+
+    # Walk backwards, collapsing folders so large expanded sample libraries are skipped.
+    for _ in range(4096):
+        before = (ui.getFocusedNodeCaption(), ui.getFocusedNodeFileType())
+        if before[1] <= -100:
+            ui.toggleBrowserNode(0)
+            yield
+        if not (yield from move_browser(midi.FPT_Up)):
+            break
+    else:
+        raise RuntimeError("Could not reach Browser root; clear Browser search and retry")
+
+    # The root and every parent are matched explicitly. Do not use substring search.
+    nodes = ["Plugin database", *parts]
+    for node_index, part in enumerate(nodes):
+        allowed = None
+        if node_index:
+            database = SCRIPT_DIR.parents[2] / "Presets" / "Plugin database"
+            parent = database.joinpath(*parts[: node_index - 1])
+            allowed = {entry.name.casefold() for entry in parent.iterdir()}
+        for _ in range(4096 if allowed is None else len(allowed) + 1):
+            caption = ui.getFocusedNodeCaption()
+            if allowed is not None and caption.casefold() not in allowed:
+                raise RuntimeError("Browser left the expected plugin folder while finding: " + part)
+            if caption.casefold() == part.casefold():
+                break
+            before = (caption, ui.getFocusedNodeFileType())
+            if before[1] <= -100:
+                ui.toggleBrowserNode(0)
+                yield
+            if not (yield from move_browser(midi.FPT_Down)):
+                raise RuntimeError("Browser node not found: " + part)
+        else:
+            raise RuntimeError("Browser navigation limit exceeded: " + part)
+        if node_index < len(nodes) - 1:
+            if ui.getFocusedNodeFileType() > -100:
+                raise RuntimeError("Expected a Browser folder: " + part)
+            ui.toggleBrowserNode(1)
+            yield
+            yield from move_browser(midi.FPT_Down)
+
+    if ui.getFocusedNodeFileType() < 0:
+        raise RuntimeError("Selected Browser node is not a plugin preset")
+    state["stage"] = "menu"
+    if state["kind"] == "effect":
+        ui.showWindow(midi.widMixer)
+        ui.setFocused(midi.widMixer)
+        yield
+    # FPT_ItemMenu opens the Browser context menu asynchronously. Merely calling
+    # selectBrowserMenuItem with no menu open does nothing (verified in FL 2026).
+    ui.showWindow(midi.widBrowser)
+    ui.setFocused(midi.widBrowser)
+    yield
+    if state["kind"] == "effect":
+        # Focusing windows can restore an earlier track. Select AFTER those
+        # asynchronous focus changes have settled, with no later focus switch.
+        mixer.setActiveTrack(state["_track"])
+        yield
+        if mixer.trackNumber() != state["_track"]:
+            raise RuntimeError("Mixer target changed before loading; retry without touching FL")
+        # Send-to-selected can still insert on Master in FL 2026. Drag to the
+        # verified empty slot instead of relying on FL's implicit destination.
+        state.update(stage="awaiting_drag", destination_slot=state["_slots"].index(False))
+    else:
+        transport.globalTransport(midi.FPT_ItemMenu, 1, midi.PME_System | midi.PME_FromMIDI)
+        state["_menu_opened"] = True
+        yield
+        while not ui.isInPopupMenu():
+            yield
+        state.update(stage="awaiting_menu", menu_action="open in new channel")
+    while not state.get("_issued"):
+        yield
+    yield
+    while True:
+        if state["kind"] == "generator":
+            count = channels.channelCount(True)
+            if count > state["_channels"]:
+                index = channels.channelNumber(True)
+                if count != state["_channels"] + 1 or index < 0:
+                    raise RuntimeError("Unexpected Channel Rack change; inspect the project")
+                if plugins.isValid(index, -1, True):
+                    name = plugins.getPluginName(index, -1, 0, True)
+                    if name.strip().casefold() in ("", "fruity wrapper", "(none)"):
+                        yield
+                        continue
+                    if state["_track"] is not None:
+                        channels.setTargetFxTrack(index, state["_track"], True)
+                    state.update(
+                        status="loaded",
+                        channel_index=index,
+                        plugin_name=name,
+                    )
+                    return
+        else:
+            track = state["_track"]
+            for slot, original in enumerate(state["_slot_names"]):
+                if original is not None and (
+                    not plugins.isValid(track, slot, True)
+                    or plugins.getPluginName(track, slot, 0, True) != original
+                ):
+                    raise RuntimeError("An existing effect changed; inspect the project")
+            added = [
+                slot
+                for slot in range(10)
+                if not state["_slots"][slot] and plugins.isValid(track, slot, True)
+            ]
+            if added:
+                if len(added) != 1:
+                    raise RuntimeError("Unexpected mixer change; inspect the project")
+                slot = added[0]
+                name = plugins.getPluginName(track, slot, 0, True)
+                if name.strip().casefold() in ("", "fruity wrapper", "(none)"):
+                    yield
+                    continue
+                state.update(
+                    status="loaded",
+                    mixer_track=track,
+                    slot_index=slot,
+                    plugin_name=name,
+                )
+                return
+        yield

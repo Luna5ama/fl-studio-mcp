@@ -11,14 +11,20 @@ Trigger: Cmd+Opt+Y (macOS) or Ctrl+Alt+Y (Windows)
 Based on work from https://github.com/calvinw/fl-studio-mcp
 """
 
-import flpianoroll as flp
 import json
 import os
 
+import flpianoroll as flp
+
+# Filled in by scripts/install_controller.py for relocated FL Studio user data.
+USER_DATA_DIR = None
+
 
 def get_script_dir():
-    """Get the directory where this script is located"""
-    return os.path.expanduser("~/Documents/Image-Line/FL Studio/Settings/Piano roll scripts")
+    """Use the same user-data root as the MIDI controller and MCP server."""
+    override = USER_DATA_DIR or os.environ.get("FL_STUDIO_USER_DATA_DIR")
+    base = os.path.expanduser(override or "~/Documents/Image-Line/FL Studio")
+    return os.path.join(base, "Settings", "Piano roll scripts")
 
 
 REQUEST_FILE = os.path.join(get_script_dir(), "mcp_request.json")
@@ -266,7 +272,7 @@ def apply(form=None):
     # This ensures Claude sees the updated piano roll state
     try:
         export_piano_roll_state()
-    except Exception as e:
+    except Exception:
         # Silent error handling - no UI shown
         pass
 
@@ -275,5 +281,5 @@ def apply(form=None):
         try:
             with open(RESPONSE_FILE, 'w') as f:
                 json.dump(result, f, indent=2)
-        except:
+        except Exception:
             pass

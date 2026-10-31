@@ -28,6 +28,11 @@ dependencies = [
     "mido>=1.3.0",
     "python-rtmidi>=1.5.0",
     "pynput>=1.7",
+    "pillow>=11; sys_platform == 'win32'",
+    "winrt-Windows.Media.Ocr>=3; sys_platform == 'win32'",
+    "winrt-Windows.Graphics.Imaging>=3; sys_platform == 'win32'",
+    "winrt-Windows.Storage.Streams>=3; sys_platform == 'win32'",
+    "winrt-Windows.Globalization>=3; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

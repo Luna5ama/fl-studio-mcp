@@ -12,8 +12,8 @@ Requirements:
 - For piano roll: ComposeWithLLM.pyscript installed in FL Studio
 
 Limitations:
-- Cannot load new plugins (only control existing ones)
-- Cannot create new patterns programmatically
+- Loading requires Windows, local English OCR, scanned plugins, English UI, and MIDI API 34+
+- Native UI workflows require Windows and an unobstructed FL Studio window
 """
 
 from __future__ import annotations
@@ -27,6 +27,12 @@ from fl_studio_mcp.tools import (
     register_plugin_tools,
     register_transport_tools,
 )
+from fl_studio_mcp.tools.arrangement import register_arrangement_tools
+from fl_studio_mcp.tools.diagnostics import register_diagnostic_tools
+from fl_studio_mcp.tools.plugin_loading import register_plugin_loading_tools
+from fl_studio_mcp.tools.plugin_management import register_plugin_management_tools
+from fl_studio_mcp.tools.project_files import register_project_file_tools
+from fl_studio_mcp.tools.routing import register_routing_tools
 from fl_studio_mcp.utils.connection import get_connection, reset_connection
 
 # Create the MCP server
@@ -42,11 +48,21 @@ Available tool categories:
 - Transport: Play, stop, record, tempo, position control
 - Mixer: Volume, pan, mute, solo, track management
 - Channels: Channel info, note triggering, step sequencer
-- Plugins: Parameter control, preset navigation (cannot load new plugins)
+- Plugins: Discover/load instruments and effects, inventory, lifecycle, full FST presets
+- Routing: Sends, buses, sidechain
+- Arrangement: Patterns, timing, visible Playlist clips
+- Files: Sample import, explicit project save, WAV export
+- Diagnostics: Controller handshake, project summary, load history and cancellation
 
 Important limitations:
-1. Cannot load new VST/AU plugins - only control existing ones
-2. Cannot create new patterns programmatically
+1. Plugin loading uses FL's Browser and scanned Plugin database entries. Use
+   fl_list_available_plugins followed by fl_add_plugin; only status=loaded confirms
+   completion. Loading requires Windows/English UI and readable, unobstructed
+   Browser and Mixer controls. Keep FL focused and untouched while loading. Never auto-retry
+   an uncertain add operation; inspect fl_get_plugin_load_status and the project.
+2. Pattern API indices and Playlist tracks/bars are one-based; channel, mixer and
+   plugin slot indices are zero-based. Native clip tools operate on the visible Playlist.
+   File save/export requires an explicit absolute output path; overwrites are opt-in.
 3. Note triggering (fl_trigger_note) is real-time only - notes won't persist
    unless FL Studio is recording. Use step sequencer (fl_set_grid_bit) for
    persistent drum patterns.
@@ -59,10 +75,10 @@ Important limitations:
 def get_fl_status() -> str:
     """Get FL Studio connection status."""
     conn = get_connection()
-    if conn.is_connected:
-        return "Connected to FL Studio via MIDI"
-    else:
-        return f"Not connected: {conn.connection_error}"
+    result = _connection_status(conn)
+    if result["connected"]:
+        return "FL Studio controller handshake verified via MIDI"
+    return "Not connected: " + str(result.get("error"))
 
 
 @mcp.resource("fl://project")
@@ -108,7 +124,10 @@ def fl_connect() -> str:
         conn.ensure_connected()
     except RuntimeError as e:
         return f"Connection failed: {e}"
-    return "Successfully connected to FL Studio via MIDI!"
+    status = _connection_status(conn)
+    if not status["connected"]:
+        return "Connection failed: " + str(status["error"])
+    return "FL Studio controller handshake verified via MIDI."
 
 
 @mcp.tool()
@@ -119,18 +138,28 @@ def fl_connection_status() -> dict:
     and any error messages if not.
     """
     conn = get_connection()
-    # Eagerly attempt a connection so the reported status reflects actual
-    # reachability rather than the lazily-initialized flag.
+    return _connection_status(conn)
+
+
+def _connection_status(conn) -> dict:
     try:
-        conn.ensure_connected()
-    except RuntimeError:
-        pass
+        response = conn.send_command("system.getCapabilities")
+    except RuntimeError as exc:
+        response = {"success": False, "error": str(exc)}
+    verified = bool(
+        response.get("success")
+        and not response.get("error")
+        and response.get("protocol_version") == 2
+        and isinstance(response.get("midi_api_version"), int)
+    )
     status = conn.get_status()
     return {
-        "connected": status.get("connected", False),
+        "connected": verified,
+        "midi_port_open": status.get("connected", False),
         "port_name": status.get("port_name"),
         "available_ports": status.get("available_ports", []),
-        "error": status.get("error"),
+        "controller": response,
+        "error": None if verified else response.get("error", "Controller protocol mismatch"),
     }
 
 
@@ -139,6 +168,12 @@ register_transport_tools(mcp)
 register_mixer_tools(mcp)
 register_channel_tools(mcp)
 register_plugin_tools(mcp)
+register_plugin_loading_tools(mcp)
+register_diagnostic_tools(mcp)
+register_routing_tools(mcp)
+register_arrangement_tools(mcp)
+register_plugin_management_tools(mcp)
+register_project_file_tools(mcp)
 register_piano_roll_tools(mcp)
 
 

@@ -1,6 +1,6 @@
 # FL Studio MCP Server
 
-**Control FL Studio with plain language.** An MCP (Model Context Protocol) server that lets AI assistants drive FL Studio through MIDI communication and Piano Roll scripts — compose melodies, adjust mixes, and automate plugins without touching the mouse.
+**Control FL Studio with plain language.** This fork connects MCP clients to FL Studio through a MIDI controller, Piano Roll scripts, and Windows native UI automation. Compose notes, manage plugins and patterns, route Mixer tracks, import samples, save projects, and render WAV files. It does not require a Computer Use tool or plugin; native operations can foreground FL Studio and use local OCR, mouse clicks, and keystrokes.
 
 [![Listed on mcpservers.org](https://mcpservers.org/badge.svg)](https://mcpservers.org/servers/karl-andres/fl-studio-mcp)
 [![Listed on awesome-mcp-servers](https://img.shields.io/badge/awesome--mcp--servers-listed-blue)](https://github.com/punkpeye/awesome-mcp-servers)
@@ -63,6 +63,7 @@ https://github.com/user-attachments/assets/c2b1a5e7-1640-41fa-82bc-18ca7cbae9e8
 - Arm tracks for recording
 - Set track names and colors
 - Stereo separation control
+- Inspect and edit sends, buses, and sidechain-only routes with host readback
 
 ### Channel Rack Control
 
@@ -75,10 +76,15 @@ https://github.com/user-attachments/assets/c2b1a5e7-1640-41fa-82bc-18ca7cbae9e8
 
 ### Plugin Control
 
+- Discover scanned plugins, including distinct VST/VST3 variants
+- Add an instrument in a new Channel Rack channel or an effect on a specified Mixer track
+- Verify the resulting channel or effect slot asynchronously
 - List plugin parameters
 - Get/set parameter values
 - Navigate presets (next/previous)
-- Query plugin info
+- Query plugin info and inventory the project
+- Enable/bypass, replace, delete, copy, or move explicitly identified instances
+- Save/load complete native FST presets; published host state is checked afterward
 
 ### Piano Roll Control
 
@@ -89,21 +95,103 @@ https://github.com/user-attachments/assets/c2b1a5e7-1640-41fa-82bc-18ca7cbae9e8
 - **Read piano roll state** to see all existing notes
 - Auto-triggering via keystroke (Cmd+Opt+Y on macOS, Ctrl+Alt+Y on Windows)
 
+### Patterns and Playlist
+
+- Create, select, rename, clone, and delete patterns
+- Read/set the BPM displayed by FL Studio; report quarter-note BPM separately
+- Read/set global time signature, with feature-specific MIDI API requirements
+- Inspect Playlist tracks and readable visible clip labels
+- Place pattern or Audio Clip sources, move clips by whole bars/tracks, and remove occurrences
+- Verify selected clip start/end PPQ ticks after native edits
+
+### Project Files and Diagnostics
+
+- Import audio into a new Sampler or Audio Clip channel, with optional name and Mixer route
+- Save As to an explicit absolute `.flp` path and verify the completed file and clean project flag
+- Render WAV to a private staging directory, verify complete audio frames and render completion, then publish the requested path
+- Check dependencies, controller installation, MIDI handshake, capabilities, and project summary
+- Inspect loading operations and request cancellation before activation
+
 ---
 
 ## Limitations
 
-> **Cannot load plugins** — The FL Studio scripting API does not support loading new VST/AU plugins. You can only control parameters of plugins that are already loaded in your project.
+**Windows native operations.** Plugin loading and lifecycle operations, native FST files,
+Playlist clip edits, sample import, project saving, and WAV rendering require Windows
+10/11, an English FL Studio UI, Windows English OCR, and a connected controller.
+No Computer Use tool is required. The server itself foregrounds FL Studio, reads local
+screenshots, and sends mouse/keyboard input. Keep FL untouched while an operation runs,
+keep relevant controls visible and unobstructed, and run one server per FL instance.
+Screenshots used for OCR are not uploaded or saved. Original MIDI/Piano Roll tools
+retain their existing macOS path; the new Windows UI workflows have no macOS implementation.
 
-> **No pattern management (yet)** — The server can write notes and step-sequencer steps into a pattern, but it has no tools to create, switch, rename, or clone patterns. Everything goes into whichever pattern is currently selected in FL Studio, so pick or create the pattern yourself before asking for notes. (FL Studio's scripting API does support this through the `patterns` module, so it could be added.)
+**Plugin targets and state.** `fl_add_plugin` uses already scanned Browser entries:
+instruments open in a new channel; effects go to an empty slot on the requested Mixer
+track. Keep Browser search clear, the Browser readable, and the Mixer inspector visible.
+Plugin loading requires MIDI API 34+. Installation and scanning remain manual.
+Existing instances can be replaced with
+`fl_replace_plugin` or explicitly authorized FST loading. Refresh inventory and supply
+`expected_plugin` before destructive edits. Native FST files include private plugin state,
+but independent verification covers plugin identity and named published parameters;
+unnamed parameter differences are reported and private state is not independently
+verified. FST staging preserves the normal display-name leaf inside an isolated
+directory; names must be legal complete Windows basenames. Invalid names are rejected
+before navigation or activation. Same-track effect moves reorder natively.
+Cross-track moves recreate the instance from FST and require `allow_recreate=True`: existing automation links are not preserved. Copies retain
+the source and do not clone its automation links.
+
+**Playlist coverage.** MIDI does not enumerate ordinary Playlist clips. Native inspection
+covers readable labels in the visible viewport; hidden, stacked, truncated, or offscreen
+clips may be omitted. Use unique fully readable track/source names and at least
+three readable bar numbers. Default numeric track names can need renaming if OCR
+is ambiguous. FL offers quick horizontal zoom presets with Shift+1/2/3 in the
+[official Playlist manual](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/playlist.htm).
+Disable clip grouping for individual edits. Placement and movement use whole-bar
+positions, set local snap to Bar, and change clip/time selections. Overlap checks cover
+visible labels only. Channel/Mixer/slot indices are zero-based; pattern, Playlist track,
+and bar indices are one-based. Explicit pattern length needs API 39+, explicit clone
+needs API 43+, tempo/time-signature setting API 38+, routing API 36+, and effect mix API 37+.
+Time-signature numerator/denominator have no independent public getters and are
+reported as unverified. Pattern lengths use quarter-note beats: on the tested Windows
+API 45 host, 16 native steps equal 4 quarter-note beats.
+
+**Tempo units.** Public `bpm` values and `fl_set_tempo` inputs use the BPM displayed in
+FL's toolbar. `quarter_bpm` reports the independent MIDI API reading;
+`ui_to_quarter_ratio` relates the two. For example, a displayed 140 BPM in 6/8 read
+back as `quarter_bpm: 70` and ratio 2. The getter checks a visible toolbar value and
+its native Tempo hint; unreadable or obstructed controls and foreground loss cause
+an explicit failure. The complete displayed-BPM read/write cycle is recorded in
+the validation record.
+
+**Project files.** Saving requires an explicit absolute `.flp` filename and changes the
+current project filename; no pathless save claims knowledge of the current disk path.
+Existing outputs require `overwrite=True`. Import creates a new channel and returns its
+actual index/name/type/route; an uncertain failure can leave that channel behind. A source
+stem equal to an empty channel name (`Sampler` or `Audio Clip`) must be renamed so a label
+change can prove loading. Import verification cannot independently read a plugin's private
+source-file path.
+
+**WAV export.** Audio is rendered inside a unique `.mcp-render-*` directory under the
+output parent, so additional selected formats or split stems cannot overwrite sibling
+user files. Only the exact verified primary WAV is published. If FL produces no primary
+WAV, the tool reports failure and keeps staging for inspection. Actual sample rate,
+bit depth, channels, and frame count come from the WAV header; global Audio Settings are
+not changed to force a sample rate. `full_song` clears the Playlist time selection and
+reports before/after bounds; it does not restore that selection. Song/Pattern mode is
+restored on success and failure, with the restoration result reported. Playback remains
+stopped. Standard RIFF/WAVE is supported; RF64/Wave64 outputs are not accepted.
+
+**Uncertain results.** A timeout or cancellation does not undo an activation already
+issued. Inspect the project and query operation status before retrying. A queued request,
+key press, or newly appearing file alone is never reported as completed work.
 
 ---
 
 ## Requirements
 
-- **FL Studio 20.7+** (MIDI Controller Scripting API)
+- **FL Studio 20.7+** for the original MIDI tools; newer APIs are required for fork extensions (see limitations and `fl_check_environment`)
 - **Python 3.10+**
-- **macOS** or **Windows**
+- **Windows 10/11** for native workflows; **macOS** for original MIDI/Piano Roll tools
   - macOS: IAC Driver (built-in, needs to be enabled)
   - Windows: [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html)
 
@@ -114,7 +202,7 @@ https://github.com/user-attachments/assets/c2b1a5e7-1640-41fa-82bc-18ca7cbae9e8
 ### macOS / Linux
 
 ```bash
-git clone https://github.com/karl-andres/fl-studio-mcp.git
+git clone https://github.com/Luna5ama/fl-studio-mcp.git
 cd fl-studio-mcp
 ./install.sh
 ```
@@ -122,7 +210,7 @@ cd fl-studio-mcp
 ### Windows
 
 ```powershell
-git clone https://github.com/karl-andres/fl-studio-mcp.git
+git clone https://github.com/Luna5ama/fl-studio-mcp.git
 cd fl-studio-mcp
 
 # Allow running local scripts for this user (one-time)
@@ -171,31 +259,57 @@ pip install -e .
 #### Windows (loopMIDI)
 
 1. Download and install [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html)
-2. Create a virtual port (any name works)
+2. Create a virtual port with a recognizable name such as `FLStudioMCP`
 3. Keep loopMIDI running while using FL Studio
+
+Without configuration, the server selects a MIDI output only when exactly one name
+contains `FL`, `IAC`, or `loopMIDI` (case-insensitive). If your port has another name or
+multiple candidates exist, set `FL_STUDIO_MIDI_PORT` in the MCP server environment to
+the exact output-port name reported by `fl_connection_status` / `fl_check_environment`.
+Opening a MIDI output does not verify that FL received a command; check the controller
+handshake with `fl_check_environment`.
 
 ### 3. Install FL Studio Scripts
 
-Copy the controller script to FL Studio's Hardware folder:
+Install the controller with automatic user-data-directory detection:
 
 ```bash
-# macOS
-mkdir -p ~/Documents/Image-Line/FL\ Studio/Settings/Hardware/FLStudioMCP
-cp fl_controller/device_FLStudioMCP.py ~/Documents/Image-Line/FL\ Studio/Settings/Hardware/FLStudioMCP/
-
-# Windows
-mkdir "%USERPROFILE%\Documents\Image-Line\FL Studio\Settings\Hardware\FLStudioMCP"
-copy fl_controller\device_FLStudioMCP.py "%USERPROFILE%\Documents\Image-Line\FL Studio\Settings\Hardware\FLStudioMCP\"
+uv run python scripts/install_controller.py
 ```
 
-Copy the Piano Roll script:
+This detects relocated Windows user data from Image-Line's registry settings and
+bakes that path into both the controller and Piano Roll script, since FL's embedded Python restricts registry
+access. Existing controllers are backed up before replacement. For another location,
+set `FL_STUDIO_USER_DATA_DIR` to the **FL Studio folder itself** (containing
+`Settings` and `Presets`) in the MCP server's environment, and run the installer
+with `--user-data-dir /path/to/FL\ Studio`. After updating, select the MIDI input in
+FL's MIDI Settings, change **Controller type** to a generic controller, then select
+**FL Studio MCP Controller** again. **Refresh device list** does not reload its Python
+modules. Restart the MCP server too. The same folder must be used by the server and controller.
+
+The following manual-copy commands also work for the default user-data location:
+
+Copy the main controller **and every `mcp_*.py` companion module** into the same
+Hardware folder. Copying only `device_FLStudioMCP.py` omits the fork extensions.
+The automatic installer above is preferred for relocated user-data folders.
+
+macOS (default location):
 
 ```bash
-# macOS
+mkdir -p ~/Documents/Image-Line/FL\ Studio/Settings/Hardware/FLStudioMCP
+cp fl_controller/device_FLStudioMCP.py fl_controller/mcp_*.py ~/Documents/Image-Line/FL\ Studio/Settings/Hardware/FLStudioMCP/
 cp scripts/ComposeWithLLM.pyscript ~/Documents/Image-Line/FL\ Studio/Settings/Piano\ roll\ scripts/
+```
 
-# Windows
-copy scripts\ComposeWithLLM.pyscript "%USERPROFILE%\Documents\Image-Line\FL Studio\Settings\Piano roll scripts\"
+Windows PowerShell (default location):
+
+```powershell
+$flHardware = Join-Path $env:USERPROFILE 'Documents\Image-Line\FL Studio\Settings\Hardware\FLStudioMCP'
+New-Item -ItemType Directory -Force -Path $flHardware
+Copy-Item fl_controller\device_FLStudioMCP.py, fl_controller\mcp_*.py -Destination $flHardware
+$flPianoRoll = Join-Path $env:USERPROFILE 'Documents\Image-Line\FL Studio\Settings\Piano roll scripts'
+New-Item -ItemType Directory -Force -Path $flPianoRoll
+Copy-Item scripts\ComposeWithLLM.pyscript -Destination $flPianoRoll
 ```
 
 ### 4. Configure FL Studio
@@ -203,8 +317,10 @@ copy scripts\ComposeWithLLM.pyscript "%USERPROFILE%\Documents\Image-Line\FL Stud
 1. **Restart FL Studio** (if it's running)
 2. Go to **Options > MIDI Settings**
 3. Under **Input**, find your virtual MIDI port (e.g., "IAC Driver Bus 1")
-4. Set the **Controller type** to **FLStudioMCP**
-5. Enable the port (click to highlight it)
+4. Set the **Controller type** to **FL Studio MCP Controller** and enable the input
+5. Assign an unused input Port number (for example, 10). Keep loopMIDI running on Windows.
+   After updating scripts, switch **Controller type** to a generic controller and then
+   back to **FL Studio MCP Controller**. **Refresh device list** does not reload scripts.
 
 ### 5. Configure Your MCP Client
 
@@ -223,6 +339,10 @@ Add to your Claude Desktop config:
   }
 }
 ```
+
+Optional environment variables go in the server entry's `env` object: `FL_STUDIO_MIDI_PORT`
+selects an exact MIDI output name; `FL_STUDIO_USER_DATA_DIR` selects the FL Studio
+user-data folder (also used when installing the controller).
 
 For Claude Code, add to your MCP settings (`~/.claude.json`, or run `claude mcp add`).
 
@@ -273,7 +393,11 @@ fl-studio-mcp
 | Tool | Description |
 |------|-------------|
 | `fl_connect` | Connect/reconnect to FL Studio |
-| `fl_connection_status` | Get connection status |
+| `fl_connection_status` | Get connection status and available MIDI outputs |
+| `fl_check_environment` | Check dependencies, installed controller, MIDI handshake, and feature capabilities |
+| `fl_get_project_summary` | Read current project metadata, tempo, and object counts |
+| `fl_get_load_operations` | List plugin-load operations from this server session |
+| `fl_cancel_plugin_load` | Request cancellation; issued activations are not rolled back |
 
 ### Transport
 
@@ -331,6 +455,9 @@ fl-studio-mcp
 
 | Tool | Description |
 |------|-------------|
+| `fl_list_available_plugins` | Search scanned plugins and return exact catalog IDs |
+| `fl_add_plugin` | Add a new instrument channel or an effect on a specified Mixer track |
+| `fl_get_plugin_load_status` | Inspect the most recent load after an uncertain timeout |
 | `fl_is_plugin_valid` | Check if plugin exists |
 | `fl_get_plugin_name` | Get plugin name |
 | `fl_get_plugin_param_count` | Get parameter count |
@@ -341,6 +468,69 @@ fl-studio-mcp
 | `fl_next_preset` | Next preset |
 | `fl_prev_preset` | Previous preset |
 | `fl_get_plugin_color` | Get plugin color |
+
+### Plugin Instances and FST Presets
+
+| Tool | Description |
+|------|-------------|
+| `fl_get_project_plugins` | Inventory instrument channels and Mixer effect instances |
+| `fl_get_plugin_instance` | Read an explicit instance and published parameter fingerprint |
+| `fl_set_effect_mix` | Set and verify a slot's host dry/wet mix |
+| `fl_set_plugin_enabled` | Mute/unmute an instrument or bypass/enable an effect |
+| `fl_delete_plugin` | Delete an instance guarded by its exact `expected_plugin` identity |
+| `fl_replace_plugin` | Replace a named instance using an exact scanned catalog entry |
+| `fl_list_plugin_presets` | Find native `.fst` files in user preset folders |
+| `fl_save_plugin_preset` | Save complete native FST state to an explicit path |
+| `fl_load_plugin_preset` | Load FST into an explicit channel or effect slot; occupied targets require authorization |
+| `fl_list_plugin_preset_operations` | List this session's FST load IDs and history |
+| `fl_get_plugin_preset_status` | Inspect a pending/uncertain native FST load |
+| `fl_cancel_plugin_preset_load` | Request cancellation before native FST activation |
+| `fl_move_effect` | Reorder within a track or explicitly recreate on another track |
+| `fl_copy_effect` | Copy complete FST state into an empty effect slot |
+
+### Mixer Routing
+
+| Tool | Description |
+|------|-------------|
+| `fl_get_mixer_routing` | Read enabled routes/send levels, or include disabled routes |
+| `fl_set_mixer_route` | Enable/disable a route, optionally disconnecting other sends |
+| `fl_set_mixer_send` | Enable a send and set its normalized level |
+| `fl_sidechain_mixer_track` | Enable a route with zero audible send level |
+| `fl_route_to_bus` | Route a batch of inserts to an existing bus track |
+
+Routes preserve other sends unless `exclusive=True` is explicit. Feedback loops are
+rejected. Sidechain routing does not select a plugin's internal sidechain detector.
+
+### Patterns, Timing, and Playlist
+
+| Tool | Description |
+|------|-------------|
+| `fl_get_patterns` | Read existing patterns and active pattern |
+| `fl_create_pattern` | Create/name an unused pattern and select it |
+| `fl_select_pattern` | Select the pattern for subsequent notes/steps |
+| `fl_rename_pattern` | Rename a pattern with readback |
+| `fl_clone_pattern` | Clone pattern data into an unused destination |
+| `fl_delete_pattern` | Delete a source pattern and affected occurrences with identity guard and confirmation |
+| `fl_get_timing` | Read displayed BPM, independent quarter-note BPM, PPQ, and global bar length |
+| `fl_set_tempo` | Set the BPM shown by FL Studio and verify display/API readback |
+| `fl_set_time_signature` | Set global time signature; denominator readback is unavailable |
+| `fl_get_playlist` | Read Playlist track metadata and timeline selection |
+| `fl_set_playlist_track` | Rename or mute a Playlist track |
+| `fl_get_visible_playlist_clips` | Inspect readable visible labels and approximate bar positions |
+| `fl_get_playlist_clip` | Select one named visible clip and read exact PPQ bounds |
+| `fl_place_pattern_clip` | Place a pattern at a whole-bar boundary |
+| `fl_place_audio_clip` | Place an existing Audio Clip channel at a whole-bar boundary |
+| `fl_move_playlist_clip` | Move a visible clip by whole bars/tracks |
+| `fl_delete_playlist_clip` | Remove one visible occurrence while retaining its source |
+| `fl_clear_playlist_time_selection` | Clear the time range with native ruler action and MIDI readback |
+
+### Sample Import and Project Files
+
+| Tool | Description |
+|------|-------------|
+| `fl_import_sample` | Create a Sampler or Audio Clip channel from an existing absolute audio path |
+| `fl_save_project` | Save As to an explicit absolute `.flp` path; overwrite is opt-in |
+| `fl_export_wav` | Render full song, current time selection, or active pattern and verify actual WAV output |
 
 ### Piano Roll
 
@@ -389,9 +579,56 @@ fl-studio-mcp
 "List the parameters of the plugin on channel 0 and set the filter cutoff to 50%"
 ```
 
+### Adding a VST instrument or effect
+
+First call `fl_list_available_plugins(query="Speldosa", kind="generator")`.
+Use an exact returned ID when VST and VST3 variants share a name:
+
+```json
+{"plugin": "Installed/Generators/VST3/Speldosa.fst", "kind": "generator"}
+```
+
+For an effect, specify the destination track explicitly:
+
+```json
+{"plugin": "Installed/Effects/VST3/Correlometer.fst", "kind": "effect", "mixer_track": 1}
+```
+
+Pass these arguments to `fl_add_plugin`. A successful result has `status: "loaded"`
+and the actual `channel_index`, or `mixer_track` and `slot_index`. A timeout is
+uncertain: a slow plugin may finish opening later. Query `fl_get_plugin_load_status`
+with the returned `operation_id` and inspect the project before retrying.
+
+### Importing and arranging audio, then saving
+
+1. Call `fl_import_sample` with an existing absolute audio path and
+   `channel_type="audio_clip"`; use the returned `channel.index` as `source_channel`.
+2. Keep that source visible in the Audio Clips Picker tab, then call
+   `fl_place_audio_clip(source_channel=..., track=1, start_bar=1)`.
+3. Call `fl_save_project` with an explicit absolute `.flp` path. Existing files
+   require `overwrite=True`.
+4. Call `fl_export_wav` with an explicit absolute `.wav` path and choose
+   `full_song`, `current_selection`, or `pattern`. Inspect `sample_rate`,
+   `bits_per_sample`, `channels`, `frames`, selection changes, and mode restoration.
+
+A Sampler import is intended for note/step playback; import as `audio_clip` when
+placing the audio file directly into Playlist. Refresh object indices after changes.
+
 ---
 
 ## Troubleshooting
+
+### Extension tools unavailable or native UI actions fail
+
+Run `fl_check_environment` and check `communication_verified`, controller modules,
+MIDI API capabilities, and English OCR availability. Reinstall the main controller
+and all `mcp_*.py` files, then switch the input's controller type to a generic
+controller and back to **FL Studio MCP Controller**. Refreshing the device list alone
+does not reload the installed modules. Restart the MCP server after source updates.
+`fl_connect` verifies the versioned controller handshake; a MIDI output merely being
+open is insufficient. For native workflows keep the English Browser/Mixer/Playlist
+controls readable, close unrelated modal dialogs, and inspect any uncertain result
+before another attempt.
 
 ### "Not connected to FL Studio"
 
@@ -489,13 +726,47 @@ pip install -e ".[dev]"
 | `uv run ruff check --fix .` | Lint and auto-fix |
 | `uv run pytest` | Run tests |
 
+### Validation Status
+
+Runtime acceptance on Windows is recorded separately from automated boundary tests.
+The following cases passed through production MCP tools in FL Studio 26.1.7 build
+5654, MIDI API 45, on 2026-10-30:
+
+| Case | Verified result |
+| --- | --- |
+| VST3 loading | Speldosa channel 6 routed to Mixer 6; Correlometer on Mixer 6, slot 0 |
+| Plugin lifecycle | Effect wet 0.37, instrument enable/disable, effect bypass/enable, native same-track move 0 → 2, and effect/instrument deletion |
+| Instrument FST | Native save/load restored Speldosa Room 0 → 1 → 0; all 150 named published parameters matched, with all 4,240 parameter records retained |
+| Effect FST | Correlometer Bypass 0 → 1 → 0; all 145 named parameters matched |
+| Cross-track copy/move | Verified FST destination and wet/bypass; copy retained source, move deleted source only after verification; automation links are not preserved |
+| Replacement/cancellation | Correlometer → Fruity Balance verified; cancellation before activation left its target empty; after acknowledged native drop it returned in 31 ms and observed the actual completed load |
+| Sample import | Complete single-call Audio Clip and Sampler imports passed; names/types/routes and prior channel identities read back |
+| Project save | Final `MCP Windows Validated 20261030.flp`: 62,509 bytes, header channel count 8, PPQ 96, clean project flag |
+| WAV export | Full-song 17.642857 s and selected range 1.714286 s; independent audio analysis confirmed both were non-silent |
+| Pattern/Audio Playlist | Public placement, exact tick readback, cross-track move and verified deletion; 16 native Pattern steps equal 4 quarter-note beats |
+| Displayed BPM read/write | Full public 6/8 cycle: display 140 → 160 → 140 / quarter 70 → 80 → 70; restored 4/4 display/quarter 140 |
+
+Normal display names through FST staging and both Picker source types passed.
+The follow-up completed public instrument deletion, cancellation after actual
+native drop, and a single-call Sampler import. The uniquely named Sampler E2E
+fixture is retained in the final eight-channel test project. Cancellation is an
+acknowledgement, not an undo; a completed operation rejects further cancellation.
+Unnamed/private plugin state and hidden sample content/path have not been
+independently accepted. See [the Windows validation record](docs/windows-validation.md).
+
+The final full suite passed **512 tests**, with Ruff clean. Native workflows still
+require readable English labels, a visible unobstructed window, and inspection of
+any uncertain result before repeating an activation.
+
 ### Project Structure
 
 ```
 fl-studio-mcp/
 ├── fl_controller/
-│   └── device_FLStudioMCP.py     # FL Studio MIDI controller script (runs inside FL Studio)
+│   ├── device_FLStudioMCP.py     # Main MIDI controller (runs inside FL Studio)
+│   └── mcp_*.py                  # Required feature modules installed alongside it
 ├── scripts/
+│   ├── install_controller.py    # Install controller/modules + baked Piano Roll script
 │   ├── setup.sh                  # FL Studio script installer
 │   ├── install_mcp_for_claude.sh # Claude config installer (macOS/Linux)
 │   ├── install_mcp_for_claude.ps1# Claude config installer (Windows)
@@ -503,6 +774,11 @@ fl-studio-mcp/
 ├── src/fl_studio_mcp/
 │   ├── server.py                 # FastMCP server entry point
 │   ├── tools/                    # MCP tool implementations
+│   │   ├── arrangement.py
+│   │   ├── diagnostics.py
+│   │   ├── plugin_management.py
+│   │   ├── project_files.py
+│   │   ├── routing.py
 │   │   ├── channels.py
 │   │   ├── mixer.py
 │   │   ├── piano_roll.py
@@ -530,7 +806,10 @@ fl-studio-mcp/
 
 Contributions are welcome! Feel free to open an issue or a pull request.
 
-Just a heads-up: this project doesn't have a proper test suite, CI, or review process for PRs yet. I'm a student maintaining this in my spare time, so changes are mostly tested by hand in FL Studio. If you'd like to help set up testing or a smoother contribution workflow, that help is especially welcome.
+This fork includes automated boundary tests and scoped Windows runtime evidence in
+[the validation record](docs/windows-validation.md). Implemented entry points and
+runtime-accepted cases are listed separately. Changes affecting FL Studio behavior
+should also be tested in the application; the repository has no CI or formal review process yet.
 
 ## License
 

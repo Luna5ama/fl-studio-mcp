@@ -1,4 +1,8 @@
 .venv/
+.tmp/
+**/__pycache__/
+.pytest_cache/
+.ruff_cache/
 .claude/
 uv.lock
 fl_controller/__pycache__/

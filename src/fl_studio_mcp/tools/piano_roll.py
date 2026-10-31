@@ -14,27 +14,25 @@ Communication flow:
 from __future__ import annotations
 
 import json
-import platform
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from fl_studio_mcp.utils.fl_paths import get_user_data_dir
 from fl_studio_mcp.utils.fl_trigger import get_trigger, trigger_fl_studio
+from fl_studio_mcp.utils.midi_connection import _mailbox_lock
 
 if TYPE_CHECKING:
     from fastmcp import FastMCP
 
 
+_SCRIPT_WAIT_TIMEOUT = 10.0
+_pending_script = None
+
+
 def _get_fl_scripts_dir() -> Path:
     """Get the FL Studio Piano Roll scripts directory."""
-    system = platform.system()
-
-    if system in ("Darwin", "Windows"):
-        base = Path.home() / "Documents" / "Image-Line" / "FL Studio" / "Settings"
-    else:
-        # Linux fallback (FL Studio doesn't officially support Linux)
-        base = Path.home() / ".fl-studio" / "Settings"
-
-    scripts_dir = base / "Piano roll scripts"
+    scripts_dir = get_user_data_dir() / "Settings" / "Piano roll scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
     return scripts_dir
 
@@ -54,39 +52,96 @@ def _get_state_file() -> Path:
     return _get_fl_scripts_dir() / "piano_roll_state.json"
 
 
+def _await_pending_script(allow_failed: bool = False) -> None:
+    """Keep a timed-out script's queue protected until its real completion arrives."""
+    global _pending_script
+    if _pending_script is None:
+        return
+    deadline = time.monotonic() + _SCRIPT_WAIT_TIMEOUT
+    while True:
+        try:
+            result = json.loads(_pending_script['response'].read_text())
+            if isinstance(result, dict) and result.get('status') == 'error':
+                if allow_failed:
+                    _pending_script = None
+                    return
+                raise RuntimeError(
+                    'The previous Piano Roll script failed; its queue is preserved. '
+                    'Inspect the project and use fl_clear_request_queue before retrying. '
+                    + str(result.get('message', ''))
+                )
+            if (isinstance(result, dict) and result.get('status') == 'success'
+                    and result.get('requests_processed') == _pending_script['count']
+                    and json.loads(_pending_script['request'].read_text()) == []):
+                _pending_script = None
+                return
+        except (OSError, ValueError):
+            pass  # FL writes JSON in place; wait for both complete records.
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                'Piano Roll script completion is unverified; the queue is preserved. '
+                'Further queue changes are blocked until its response arrives. '
+                'Inspect FL Studio before retrying or triggering the script manually.'
+            )
+        time.sleep(.05)
+
+
+def _trigger_and_wait() -> bool:
+    """Verify consumption of this queue instead of relying on the hotkey delay."""
+    global _pending_script
+    _await_pending_script()
+    request_file = _get_request_file()
+    requests = json.loads(request_file.read_text()) if request_file.exists() else []
+    count = len(requests) if isinstance(requests, list) else int(bool(requests))
+    if count:
+        response_file = _get_response_file()
+        response_file.unlink(missing_ok=True)
+        _pending_script = {'request': request_file, 'response': response_file, 'count': count}
+    success = trigger_fl_studio()
+    if success:
+        _await_pending_script()
+    return success
+
+
 def _write_request(request: dict | list) -> None:
     """Write a request to the MCP request file."""
-    request_file = _get_request_file()
 
-    # Read existing requests if any
-    existing = []
-    if request_file.exists():
-        try:
-            with open(request_file) as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    existing = data
-                elif isinstance(data, dict):
-                    existing = [data]
-        except (json.JSONDecodeError, IOError):
-            existing = []
+    with _mailbox_lock:
+        _await_pending_script()
+        request_file = _get_request_file()
 
-    # Append new request(s)
-    if isinstance(request, list):
-        existing.extend(request)
-    else:
-        existing.append(request)
+        # Read existing requests if any
+        existing = []
+        if request_file.exists():
+            try:
+                with open(request_file) as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        existing = data
+                    elif isinstance(data, dict):
+                        existing = [data]
+            except (json.JSONDecodeError, IOError):
+                existing = []
 
-    # Write back
-    with open(request_file, "w") as f:
-        json.dump(existing, f, indent=2)
+        # Append new request(s)
+        if isinstance(request, list):
+            existing.extend(request)
+        else:
+            existing.append(request)
+
+        # Write back
+        with open(request_file, "w") as f:
+            json.dump(existing, f, indent=2)
 
 
 def _clear_request_file() -> None:
     """Clear the request file."""
-    request_file = _get_request_file()
-    if request_file.exists():
-        request_file.unlink()
+
+    with _mailbox_lock:
+        _await_pending_script(allow_failed=True)
+        request_file = _get_request_file()
+        if request_file.exists():
+            request_file.unlink()
 
 
 def _read_state() -> dict | None:
@@ -117,9 +172,19 @@ def _get_trigger_info(auto_trigger: bool) -> str:
     trigger = get_trigger()
     if not trigger.is_supported:
         return f" Auto-trigger not supported on {trigger.platform}. Press the trigger key manually."
-    if trigger_fl_studio():
-        return " FL Studio triggered successfully."
+    try:
+        if _trigger_and_wait():
+            return " FL Studio processed the queued requests."
+    except RuntimeError as exc:
+        return f" Warning: {exc}"
     return f" Warning: Could not trigger FL Studio. Press {trigger.keystroke} manually."
+
+
+def _queue_request(request: dict | list, auto_trigger: bool) -> str:
+    """Keep queue mutation and its script execution in one native transaction."""
+    with _mailbox_lock:
+        _write_request(request)
+        return _get_trigger_info(auto_trigger)
 
 
 def register_piano_roll_tools(mcp: FastMCP) -> None:
@@ -179,9 +244,7 @@ def register_piano_roll_tools(mcp: FastMCP) -> None:
             "notes": notes
         })
 
-        _write_request(requests)
-
-        trigger_info = _get_trigger_info(auto_trigger)
+        trigger_info = _queue_request(requests, auto_trigger)
         note_count = len(notes)
         note_summary = ", ".join(
             f"{_midi_to_note_name(n['midi'])}@{n.get('time', 0)}"
@@ -234,9 +297,7 @@ def register_piano_roll_tools(mcp: FastMCP) -> None:
             "notes": chord_notes
         }
 
-        _write_request(request)
-
-        trigger_info = _get_trigger_info(auto_trigger)
+        trigger_info = _queue_request(request, auto_trigger)
         note_names = ", ".join(_midi_to_note_name(n) for n in midi_notes)
         return f"Queued chord [{note_names}] at beat {time}, duration {duration}.{trigger_info}"
 
@@ -263,9 +324,7 @@ def register_piano_roll_tools(mcp: FastMCP) -> None:
             "action": "delete_notes",
             "notes": notes
         }
-        _write_request(request)
-
-        trigger_info = _get_trigger_info(auto_trigger)
+        trigger_info = _queue_request(request, auto_trigger)
         return f"Queued deletion of {len(notes)} note(s).{trigger_info}"
 
     @mcp.tool()
@@ -276,9 +335,7 @@ def register_piano_roll_tools(mcp: FastMCP) -> None:
             auto_trigger: Whether to automatically trigger FL Studio
         """
         request = {"action": "clear"}
-        _write_request(request)
-
-        trigger_info = _get_trigger_info(auto_trigger)
+        trigger_info = _queue_request(request, auto_trigger)
         return f"Queued clear all notes.{trigger_info}"
 
     @mcp.tool()
@@ -329,7 +386,11 @@ def register_piano_roll_tools(mcp: FastMCP) -> None:
         if not trigger.is_supported:
             return f"Error: Auto-trigger not supported on {trigger.platform}"
 
-        success = trigger_fl_studio()
+        with _mailbox_lock:
+            try:
+                success = _trigger_and_wait()
+            except RuntimeError as exc:
+                return f"Script completion unverified: {exc}"
 
         if success:
             return "FL Studio triggered successfully. Notes should now appear in the piano roll."

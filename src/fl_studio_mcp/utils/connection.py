@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from fl_studio_mcp.utils.midi_connection import _mailbox_lock
 from fl_studio_mcp.utils.midi_connection import (
     get_connection as get_midi_connection,
 )
@@ -46,6 +47,10 @@ class FLConnection:
     def connection_error(self) -> str | None:
         """Get the last connection error, if any."""
         return self._midi.connection_error
+
+    def transaction(self):
+        """Hold the shared mailbox lock for an entire operation."""
+        return self._midi.transaction()
 
     def send_command(
         self,
@@ -88,5 +93,6 @@ def get_connection() -> FLConnection:
 def reset_connection() -> None:
     """Reset the connection state to allow reconnection attempts."""
     global _connection
-    reset_midi_connection()
-    _connection = None
+    with _mailbox_lock:
+        reset_midi_connection()
+        _connection = None
